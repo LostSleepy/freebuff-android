@@ -1,0 +1,28 @@
+{
+  "name": "freebuff-android",
+  "version": "0.2.0",
+  "description": "Launcher NO oficial de Freebuff para Android/Termux: ejecuta el binario oficial Linux ARM64 con glibc-runner (sin PRoot), verificación SHA-256, rollback ante descargas corruptas y shim para el terminal command broker.",
+  "license": "MIT",
+  "bin": {
+    "freebuff": "index.js"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "patches",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "tar": "^7.4.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check patches/apply.js",
+    "test": "node --test test/unit/*.test.js",
+    "test:e2e": "bash test/e2e/run.sh",
+    "doctor": "node index.js android-doctor"
+  }
+}
