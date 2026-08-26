@@ -2,10 +2,11 @@
 
 > ⚠️ **Unofficial layer.** This project is not affiliated with, endorsed by, or
 > sponsored by Codebuff/Freebuff. It is a community-made compatibility layer
-> that **runs the official Freebuff Linux ARM64 binary** on Android/Termux via
-> `glibc-runner` (`grun`) — no PRoot, no emulation. **Android is not officially
-> supported by Freebuff**; this is a compatibility port, not an official
-> product.
+> that **runs the official Freebuff Linux ARM64 binary** on Android/Termux —
+> in direct mode (patched ELF interpreter + no `LD_PRELOAD`) or via
+> `glibc-runner` (`grun`) as fallback — no PRoot, no emulation. **Android is
+> not officially supported by Freebuff**; this is a compatibility port, not an
+> official product.
 
 - Uses the binary published by Freebuff itself in their official releases
   (`CodebuffAI/codebuff-community`) — never third-party binaries.
@@ -15,7 +16,34 @@
   GitHub before installing.
 - **Rolls back** if the download/update is corrupt or the new binary fails to
   start.
-- Ships a **`grun`-specific terminal command broker shim** (see `patches/`).
+- Runs the official binary in **direct mode** (rewrites its ELF interpreter
+  with a bundled `patchelf` and drops `LD_PRELOAD`), which makes the
+  **terminal command broker work without patching the CLI source**.
+
+## Direct execution mode (v0.3.0)
+
+The official binary expects the interpreter `/lib/ld-linux-aarch64.so.1`, a
+path that does not exist on Android. `glibc-runner` works around it by
+launching the binary through `ld.so`, but then `process.execPath` points at
+`ld.so` and the terminal command broker cannot re-execute itself — so running
+terminal commands inside Freebuff failed with "terminal command broker protocol
+response was missing".
+
+The wrapper fixes this without touching the CLI source:
+
+1. After install/update it rewrites the binary's **ELF interpreter**
+   (`patchelf --set-interpreter`) to the real glibc loader of `glibc-runner`
+   (`$PREFIX/glibc/lib/ld-linux-aarch64.so.1`), verified with a direct smoke
+   test before replacing the binary.
+2. It runs the binary **directly** (no `grun`) with **`LD_PRELOAD` removed**
+   (Termux's `libtermux-exec-ld-preload.so` breaks the loader's library
+   resolution; `glibc-runner` does the same unset).
+3. Now `process.execPath` is the binary itself, so the broker re-executes it
+   correctly and terminal commands work with the **official, unpatched
+   binary**. Verified on hardware: `Broker E2E (directa): ok, exitCode 0`.
+
+If `patchelf` or the direct smoke test fails, the wrapper falls back to
+`grun` mode (the TUI works, but terminal commands are unavailable).
 
 ## Status: verified on real Android hardware
 
@@ -26,11 +54,13 @@ Tested on a real Termux device (ARM64 / aarch64) over SSH:
   release digest.
 - **ELF AArch64** header validated before install.
 - `android-doctor`: environment, binary, integrity, shim and **minimal broker
-  E2E all pass** (the binary answers `--terminal-command-broker`).
+  E2E all pass** — including in **direct mode** (the binary answers
+  `--terminal-command-broker` with `exitCode 0`, so terminal commands work).
 - Shim preserved across an update.
-- The binary's `--version` and `--help` work through `grun`.
+- The binary's `--version` and `--help` work both through `grun` and in
+  direct mode.
 - **The full TUI launches and renders** (project folder picker).
-- 21/21 unit tests pass on the phone itself.
+- 28/28 unit tests pass on the phone itself.
 
 ## Known limitation: SIGSYS when terminating the TUI
 
@@ -104,28 +134,27 @@ The install/update flow (`installOrUpdate`) does, in order:
 If the network is down or GitHub fails, the installed version is kept. The
 wrapper never auto-downgrades a working install.
 
-## The terminal command broker and the shim
+## The terminal command broker
 
 Freebuff runs terminal commands through a "broker": the CLI re-executes itself
-with `--terminal-command-broker` using `process.execPath`. On Android, `grun`
-launches the Bun binary through `ld.so`, so inside the binary
-`process.execPath` points at the loader, not the binary, and the broker cannot
-re-execute itself.
+with `--terminal-command-broker` using `process.execPath`. Under `grun` that
+path points at `ld.so` and the broker cannot re-execute itself. The wrapper
+solves it in **direct mode** (see above): the binary runs with
+`process.execPath` = itself, so the broker just works with the official
+binary.
 
-The wrapper solves this:
-
-- Creates a **shim** (`~/.config/manicode/freebuff-broker-shim`, see
-  `lib/broker-shim.sh`) that re-invokes `grun` with the real binary.
-- Exposes it to the binary via `FREEBUFF_ANDROID_BROKER_SHIM` (+
-  `FREEBUFF_ANDROID_BIN` and `FREEBUFF_ANDROID_GRUN`).
-- The CLI must be built with the **patch** in `patches/` so
-  `defaultBrokerInvocation()` honours that variable. In the hardware test the
-  minimal broker E2E passed with the official 0.0.156 binary through the shim.
+For completeness, the wrapper still ships a **`grun` shim**
+(`~/.config/manicode/freebuff-broker-shim`, see `lib/broker-shim.sh`) and a
+**CLI source patch** (`patches/`, applier `patches/apply.js`) that make the
+broker work through `FREEBUFF_ANDROID_BROKER_SHIM` for custom CLI builds:
 
 ```bash
 # Apply the patch to a CLI source checkout (idempotent):
 node patches/apply.js /path/to/checkout/cli/src/utils
 ```
+
+Direct mode is preferred: it needs no patch and works with the official
+release binary.
 
 ### `android-doctor`
 
@@ -153,12 +182,16 @@ hardcoded install paths:
 | Shim | `$HOME/.config/manicode/freebuff-broker-shim` |
 | Download cache | `$HOME/.config/manicode/.freebuff-android-download/` (self-cleaning) |
 
+`patchelf` (aarch64) is bundled in the npm package (`lib/patchelf-aarch64`);
+no extra install needed.
+
 ## Project structure
 
 ```
 freebuff-android/
 ├── index.js                  # Definitive launcher (`freebuff` entry point)
 ├── lib/broker-shim.sh        # Canonical shim copy (verified by tests)
+├── lib/patchelf-aarch64      # Bundled patchelf (ARM64) for direct mode
 ├── patches/
 │   ├── terminal-command-broker.patch.ts   # CLI patch documentation
 │   └── apply.js              # Idempotent patch applier
@@ -183,13 +216,13 @@ bash test/e2e/run.sh /path/to/codebuff-checkout
 ## Limitations
 
 - It does not turn Android into Linux: it runs the official Linux ARM64 binary
-  with `glibc-runner`. If the binary depends on syscalls or functions missing
-  or incompatible with Android, it will need fixing (see `android-doctor` and
-  the SIGSYS limitation above).
+  (directly, or via `glibc-runner` as fallback). If the binary depends on
+  syscalls or functions missing or incompatible with Android, it will need
+  fixing (see `android-doctor` and the SIGSYS limitation above).
 - No PRoot, no emulation, no full Linux distribution.
-- The broker shim worked in the hardware test with the **official 0.0.156
-  binary** (broker E2E passed). The patch in `patches/` is kept documented for
-  custom CLI builds and as reference.
+- Direct mode requires `glibc-runner`'s glibc loader (installed by
+  `pkg install glibc-repo glibc-runner`); if it is missing, the wrapper falls
+  back to `grun` mode where terminal commands are unavailable.
 - ARM64 only; no x86 Android support.
 
 ## License

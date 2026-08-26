@@ -32,7 +32,7 @@ const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const tar = require('tar');
 
-const WRAPPER_VERSION = '0.2.0';
+const WRAPPER_VERSION = '0.3.0';
 const PACKAGE = 'freebuff';
 const DISPLAY_NAME = 'Freebuff';
 const RELEASE_REPO = 'CodebuffAI/codebuff-community';
@@ -88,6 +88,10 @@ function createConfig(env = process.env, homedir = os.homedir) {
     tempDir: path.join(configDir, `.${PACKAGE}-android-download`),
     shimPath: path.join(configDir, `${PACKAGE}-broker-shim`),
     backupPath: path.join(configDir, `${PACKAGE}.previous`),
+    // patchelf aarch64 empaquetado en el paquete npm (lib/patchelf-aarch64).
+    patchelfPath: path.join(__dirname, 'lib', 'patchelf-aarch64'),
+    // Directorio de librerías glibc de glibc-runner, derivado de $PREFIX.
+    glibcPrefix: env.PREFIX ? path.join(env.PREFIX, 'glibc') : null,
     // Solo detección: nunca se escribe en esta ruta.
     termuxUsrPrefix: '/data/data/com.termux/files/usr',
   };
@@ -103,6 +107,19 @@ function isAndroid(env = process.env, fsImpl = fs) {
 
 function isArm64() {
   return process.arch === 'arm64' || process.arch === 'aarch64';
+}
+
+/**
+ * Entorno para ejecutar el binario DIRECTO: LD_PRELOAD y LD_LIBRARY_PATH
+ * fuera. LD_PRELOAD (libtermux-exec-ld-preload.so) rompe la resolución de
+ * librerías del loader glibc cuando se invoca por PT_INTERP, y LD_LIBRARY_PATH
+ * no hace falta (el loader usa su ruta de sistema). grun hace lo mismo.
+ */
+function sanitizeEnv(env) {
+  const clean = { ...env };
+  delete clean.LD_PRELOAD;
+  delete clean.LD_LIBRARY_PATH;
+  return clean;
 }
 
 /** Comparador semver numérico simple ("1.2.3" vs "1.10.0"). */
@@ -121,6 +138,7 @@ function compareVersions(a, b) {
 /** E/S inyectable para poder testear sin red ni disco real. */
 function defaultIo({
   env = process.env,
+  config = createConfig(env),
   spawnSyncFn = spawnSync,
   spawnFn = spawn,
   fsImpl = fs,
@@ -267,6 +285,87 @@ function defaultIo({
     },
 
     /**
+     * Lee el intérprete (PT_INTERP) declarado por el ELF. null si no es ELF
+     * o no se pudo leer. Se parsean los program headers a mano (sin readelf).
+     */
+    readElfInterp(file) {
+      try {
+        const buf = fsImpl.readFileSync(file);
+        if (
+          buf.length < 64 ||
+          !buf.subarray(0, 4).equals(ELF_MAGIC)
+        ) {
+          return null;
+        }
+        const phoff = Number(buf.readBigUInt64LE(32));
+        const phentsize = buf.readUInt16LE(54);
+        const phnum = buf.readUInt16LE(56);
+        for (let i = 0; i < phnum; i++) {
+          const off = phoff + i * phentsize;
+          const type = buf.readUInt32LE(off);
+          if (type === 3) {
+            // PT_INTERP
+            const pOffset = Number(buf.readBigUInt64LE(off + 8));
+            const pFilesz = Number(buf.readBigUInt64LE(off + 32));
+            return buf
+              .subarray(pOffset, pOffset + pFilesz)
+              .toString('utf8')
+              .replace(/\0+$/, '');
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * Localiza el loader glibc de glibc-runner (derivado de $PREFIX).
+     */
+    findLoader(config) {
+      if (!config.glibcPrefix) return null;
+      const candidates = [
+        path.join(config.glibcPrefix, 'lib', 'ld-linux-aarch64.so.1'),
+        path.join(config.glibcPrefix, 'lib', 'ld-linux-aarch64.so.2'),
+        path.join(config.glibcPrefix, 'bin', 'ld.so'),
+      ];
+      return candidates.find((c) => fsImpl.existsSync(c)) || null;
+    },
+
+    /**
+     * Reescribe el intérprete del binario con el patchelf empaquetado.
+     * Devuelve true si patchelf terminó con status 0.
+     */
+    patchelfInterp(bin, interp) {
+      const r = spawnSyncFn(config.patchelfPath, ['--set-interpreter', interp, bin], {
+        stdio: 'ignore',
+        timeout: 60000,
+      });
+      return !r.error && r.status === 0;
+    },
+
+    /**
+     * Smoke test del binario ejecutado DIRECTO (sin grun) con el entorno
+     * saneado (LD_PRELOAD fuera). Exige que arranque y que --version devuelva
+     * algo con forma de versión (p.ej. 0.0.156).
+     */
+    directSmokeTest(bin) {
+      let r;
+      try {
+        r = spawnSyncFn(bin, ['--version'], {
+          timeout: 20000,
+          encoding: 'utf8',
+          env: sanitizeEnv(env),
+        });
+      } catch {
+        return false;
+      }
+      if (r.error) return r.error.code === 'ETIMEDOUT';
+      if (r.signal && !['SIGKILL', 'SIGTERM'].includes(r.signal)) return false;
+      return r.status === 0 && /\d+\.\d+\.\d+/.test(r.stdout || '');
+    },
+
+    /**
      * Smoke test del binario recién instalado: debe arrancar y salir por sí
      * solo (o agotar nuestro timeout, lo que demuestra que cargó). Cualquier
      * fallo de carga (ENOEXEC, segfault, SIGILL...) lo rechaza.
@@ -289,6 +388,91 @@ function defaultIo({
       }
       if (r.signal && !['SIGKILL', 'SIGTERM'].includes(r.signal)) return false;
       return true;
+    },
+
+    /**
+     * E2E mínimo del broker en modo DIRECTO (usado por android-doctor cuando
+     * el binario está preparado para ejecución directa): arranca el binario
+     * directamente con el flag de broker (sin grun ni shim) y comprueba que
+     * responde por el archivo de protocolo. Devuelve { ok, detail }.
+     */
+    brokerDirectE2E(bin, { config, env: envArg = env } = {}) {
+      const protocolFile = path.join(
+        tmpdirFn(),
+        `freebuff-terminal-command-broker-${process.pid}-${crypto.randomUUID()}.json`,
+      );
+      const request = {
+        executable: '/bin/sh',
+        args: ['-c', 'printf broker-directo-ok; exit 0'],
+        cwd: envArg.HOME || '/',
+        env: { PATH: envArg.PATH || '/usr/bin:/bin' },
+      };
+      return new Promise((resolve) => {
+        let settled = false;
+        let timer = null;
+        let child;
+        const finish = (ok, detail) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          try {
+            fsImpl.unlinkSync(protocolFile);
+          } catch {}
+          resolve({ ok, detail });
+        };
+
+        try {
+          child = spawnFn(bin, ['--terminal-command-broker'], {
+            stdio: ['pipe', 'inherit', 'inherit'],
+            env: sanitizeEnv({
+              ...envArg,
+              CODEBUFF_TERMINAL_COMMAND_BROKER: '1',
+              CODEBUFF_TERMINAL_COMMAND_BROKER_PROTOCOL: protocolFile,
+            }),
+          });
+        } catch (e) {
+          return finish(false, `No se pudo lanzar el binario: ${e.message}`);
+        }
+        child.on('error', (e) => finish(false, `Error al lanzar el binario: ${e.message}`));
+        child.stdin.on('error', () => {});
+        child.stdin.end(JSON.stringify(request));
+
+        timer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {}
+          finish(false, 'Timeout esperando la respuesta del broker');
+        }, 20000);
+
+        const deadline = Date.now() + 20000;
+        const poll = () => {
+          if (settled) return;
+          if (fsImpl.existsSync(protocolFile)) {
+            try {
+              const payload = JSON.parse(
+                fsImpl.readFileSync(protocolFile, 'utf8').trim(),
+              );
+              if (payload.ok === true && payload.exitCode === 0) {
+                finish(true, 'El broker respondió ok con exitCode 0');
+              } else {
+                finish(false, `El broker respondió: ${JSON.stringify(payload)}`);
+              }
+            } catch (e) {
+              finish(false, `Archivo de protocolo inválido: ${e.message}`);
+            }
+            return;
+          }
+          if (Date.now() > deadline) {
+            try {
+              child.kill('SIGKILL');
+            } catch {}
+            finish(false, 'Timeout: no apareció el archivo de protocolo');
+            return;
+          }
+          setTimeout(poll, 100);
+        };
+        poll();
+      });
     },
 
     /**
@@ -383,7 +567,7 @@ function defaultIo({
 function createWrapper({
   env = process.env,
   config = createConfig(env),
-  io = defaultIo({ env }),
+  io = defaultIo({ env, config }),
   fsImpl = fs,
 } = {}) {
   const { die } = io;
@@ -568,16 +752,23 @@ function createWrapper({
         );
       }
 
+      const prepared = await prepareDirectRun();
       writeMeta({
         version: rel.version,
         target: 'linux-arm64',
         sha256: got,
         binarySha256: await io.sha256(config.binaryPath),
+        directRun: prepared.mode === 'direct',
         updatedAt: new Date().toISOString(),
         source: rel.url,
       });
       ensureBrokerShim();
-      console.error(`✅ ${DISPLAY_NAME} ${rel.version} instalado.`);
+      console.error(
+        `✅ ${DISPLAY_NAME} ${rel.version} instalado.` +
+          (prepared.mode === 'direct'
+            ? ' (ejecución directa, broker OK)'
+            : ' (modo grun; broker no disponible)'),
+      );
       return rel.version;
     } catch (e) {
       if (replaced && backupMade && fsImpl.existsSync(config.backupPath)) {
@@ -597,6 +788,63 @@ function createWrapper({
       }
       try {
         fsImpl.rmSync(config.tempDir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+
+  /**
+   * Prepara el binario para EJECUCIÓN DIRECTA (sin grun): reescribe el
+   * intérprete ELF (PT_INTERP) al loader glibc real con el patchelf
+   * empaquetado, de modo que process.execPath apunte al binario y el terminal
+   * command broker funcione con el binario oficial sin parchear.
+   *
+   * Idempotente: si el intérprete ya es el correcto, solo verifica con un
+   * smoke test directo. Devuelve { mode: 'direct' | 'grun', loader, interp }.
+   */
+  async function prepareDirectRun() {
+    if (!fsImpl.existsSync(config.binaryPath)) {
+      return { mode: 'grun', loader: null, interp: null };
+    }
+    const loader = io.findLoader(config);
+    if (!loader) {
+      console.error(
+        '⚠️ No se encontró el loader glibc; se usará modo grun (broker no disponible).',
+      );
+      return { mode: 'grun', loader: null, interp: null };
+    }
+
+    const current = io.readElfInterp(config.binaryPath);
+    if (current === loader) {
+      return {
+        mode: io.directSmokeTest(config.binaryPath) ? 'direct' : 'grun',
+        loader,
+        interp: current,
+      };
+    }
+
+    // Reescribir el intérprete sobre una copia y verificar antes de reemplazar
+    // (evita dejar un binario roto si patchelf falla, como con --set-rpath).
+    const tmp = path.join(config.tempDir, `${PACKAGE}.direct`);
+    fsImpl.mkdirSync(path.dirname(tmp), { recursive: true });
+    try {
+      fsImpl.copyFileSync(config.binaryPath, tmp);
+      fsImpl.chmodSync(tmp, 0o755);
+      if (!io.patchelfInterp(tmp, loader)) {
+        console.error('⚠️ patchelf falló al reescribir el intérprete; se usará modo grun.');
+        return { mode: 'grun', loader, interp: current };
+      }
+      if (!io.directSmokeTest(tmp)) {
+        console.error(
+          '⚠️ El binario reescrito no arranca en modo directo; se usará modo grun.',
+        );
+        return { mode: 'grun', loader, interp: current };
+      }
+      fsImpl.renameSync(tmp, config.binaryPath);
+      console.error('⚙️  Ejecución directa preparada (intérprete glibc + LD_PRELOAD fuera).');
+      return { mode: 'direct', loader, interp: loader };
+    } finally {
+      try {
+        fsImpl.rmSync(tmp, { force: true });
       } catch {}
     }
   }
@@ -645,6 +893,16 @@ function createWrapper({
     console.log(`Versión: ${meta?.version || 'desconocida'}`);
     console.log(`Target: ${meta?.target || '(sin metadata)'}`);
 
+    // Estado de ejecución: directa (broker OK) o grun (broker no disponible).
+    if (binExists) {
+      const loader = io.findLoader(config);
+      const interp = io.readElfInterp(config.binaryPath);
+      const direct = meta?.directRun === true && interp === loader;
+      console.log(`Ejecución: ${direct ? 'DIRECTA (sin grun, broker OK)' : 'vía grun (broker no disponible)'}`);
+      console.log(`  Intérprete ELF: ${interp || '(no legible)'}`);
+      console.log(`  Loader glibc: ${loader || 'NO ENCONTRADO'}`);
+    }
+
     const shim = doctorShimStatus();
     console.log(`Broker shim: ${shim.ok ? shim.label : shim.label} → ${config.shimPath}`);
 
@@ -652,7 +910,13 @@ function createWrapper({
       console.log('\n➜ El binario no está instalado. Ejecuta: freebuff android-setup');
       return;
     }
-    if (!runnerCmd) {
+
+    const direct = meta?.directRun === true && io.readElfInterp(config.binaryPath) === io.findLoader(config);
+    if (direct && !runnerCmd) {
+      // La ejecución directa no necesita grun para el binario, pero sí para
+      // el shim. Se avisa pero no se bloquea.
+      console.log('\n➜ glibc-runner no está en PATH (solo afecta al shim de respaldo).');
+    } else if (!direct && !runnerCmd) {
       console.log('\n➜ Falta glibc-runner: pkg install glibc-repo glibc-runner');
       return;
     }
@@ -662,21 +926,22 @@ function createWrapper({
       console.log(`\n➜ Shim reparado: ${after.label}`);
     }
 
-    console.log('\nPrueba E2E mínima del broker (shim → grun → binario)...');
-    const e2e = await io.brokerE2E(runnerCmd, config.binaryPath, config.shimPath, {
-      config,
-      env,
-    });
+    console.log('\nPrueba E2E mínima del broker...');
+    const e2e = direct
+      ? await io.brokerDirectE2E(config.binaryPath, { config, env })
+      : await io.brokerE2E(runnerCmd, config.binaryPath, config.shimPath, {
+          config,
+          env,
+        });
     console.log(
       e2e.ok
-        ? `✅ Broker E2E: ${e2e.detail}`
+        ? `✅ Broker E2E (${direct ? 'directa' : 'vía shim/grun'}): ${e2e.detail}`
         : `❌ Broker E2E: ${e2e.detail}`,
     );
-    if (!e2e.ok) {
+    if (!e2e.ok && !direct) {
       console.log(
-        '   Si el binario es la release oficial sin compilar, puede que no incluya\n' +
-          '   el parche FREEBUFF_ANDROID_BROKER_SHIM (ver patches/). El shim queda\n' +
-          '   instalado igualmente y activará el broker cuando el binario lo soporte.',
+        '   El broker vía grun requiere el parche FREEBUFF_ANDROID_BROKER_SHIM\n' +
+          '   (ver patches/) o la ejecución directa (android-update la prepara).',
       );
     }
   }
@@ -743,6 +1008,23 @@ function createWrapper({
     }
     await installOrUpdate({ force: false });
 
+    // Preparar ejecución directa (patchelf interp) si no está ya hecha.
+    const prepared = await prepareDirectRun();
+    const directRun =
+      prepared.mode === 'direct' &&
+      io.readElfInterp(config.binaryPath) === io.findLoader(config);
+    if (directRun) {
+      // Mantener la metadata coherente si la preparación cambió algo.
+      const m = readMeta();
+      if (m && m.directRun !== true) {
+        writeMeta({
+          ...m,
+          directRun: true,
+          binarySha256: await io.sha256(config.binaryPath),
+        });
+      }
+    }
+
     // Shim + variables de entorno para el broker (ver lib/broker-shim.sh y patches/).
     const shimPath = ensureBrokerShim();
 
@@ -797,20 +1079,25 @@ function createWrapper({
       process.on(sig, onSignal);
     }
 
-    child = spawn(
-      runnerCmd,
-      [config.binaryPath, ...args],
-      {
-        stdio: 'inherit',
-        env: {
-          ...process.env,
-          TERM: process.env.TERM || 'xterm-256color',
-          FREEBUFF_ANDROID_BIN: config.binaryPath,
-          FREEBUFF_ANDROID_GRUN: runnerCmd,
-          FREEBUFF_ANDROID_BROKER_SHIM: shimPath,
-        },
-      },
-    );
+    const baseEnv = {
+      ...process.env,
+      TERM: process.env.TERM || 'xterm-256color',
+      FREEBUFF_ANDROID_BIN: config.binaryPath,
+      FREEBUFF_ANDROID_GRUN: runnerCmd,
+      FREEBUFF_ANDROID_BROKER_SHIM: shimPath,
+    };
+    child = directRun
+      ? // Ejecución directa: process.execPath = binario → el broker se
+        // re-ejecuta solo. LD_PRELOAD/LD_LIBRARY_PATH fuera (ver sanitizeEnv).
+        spawn(config.binaryPath, args, {
+          stdio: 'inherit',
+          env: sanitizeEnv(baseEnv),
+        })
+      : // Respaldo: vía grun (la TUI funciona; el broker requiere parche/shims).
+        spawn(runnerCmd, [config.binaryPath, ...args], {
+          stdio: 'inherit',
+          env: baseEnv,
+        });
 
     child.on('error', (e) => {
       resetTerminal();
@@ -836,6 +1123,7 @@ function createWrapper({
     writeMeta,
     ensureBrokerShim,
     installOrUpdate,
+    prepareDirectRun,
     isAndroid,
     isArm64,
     compareVersions,
@@ -851,6 +1139,7 @@ module.exports = {
   WRAPPER_VERSION,
   compareVersions,
   ELF_AARCH64,
+  sanitizeEnv,
 };
 
 if (require.main === module) {

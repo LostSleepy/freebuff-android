@@ -60,7 +60,7 @@ test('doctor informa del estado del shim y ejecuta la E2E mínima', async () => 
     assert.match(out, /ELF: ARM64 válido/);
     assert.match(out, /Versión: 1\.2\.3/);
     assert.match(out, /Broker shim: OK/);
-    assert.match(out, /Broker E2E: El broker respondió ok/);
+    assert.match(out, /Broker E2E.*El broker respondió ok/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
