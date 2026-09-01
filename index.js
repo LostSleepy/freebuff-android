@@ -32,7 +32,7 @@ const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const tar = require('tar');
 
-const WRAPPER_VERSION = '0.3.0';
+const WRAPPER_VERSION = '0.4.0';
 const PACKAGE = 'freebuff';
 const DISPLAY_NAME = 'Freebuff';
 const RELEASE_REPO = 'CodebuffAI/codebuff-community';
@@ -73,6 +73,33 @@ const BROKER_SHIM_TEMPLATE = [
 ].join('\n');
 
 /**
+ * Decide si inyectar el shim DNS (dns-redirect-aarch64.so) al lanzar el
+ * binario. El resolver interno de Bun (c-ares) lee literalmente
+ * /etc/resolv.conf, un archivo que NO existe en Android (solo root podría
+ * crearlo), así que cae a 127.0.0.1:53 y toda resolución muere con
+ * "getaddrinfo ETIMEOUT" (read_url, etc.). El shim redirige ese path al
+ * resolv.conf de glibc-runner ($PREFIX/etc/resolv.conf), que sí tiene servidores
+ * alcanzables por UDP directo.
+ *
+ * Se desactiva con FREEBUFF_ANDROID_NO_DNS_SHIM=1, y no aplica en Linux
+ * normal (donde /etc/resolv.conf existe). Solo funciona en ejecución directa:
+ * grun elimina LD_PRELOAD, así que en modo grun el shim no se cargaría.
+ *
+ * Devuelve { shim, resolvConf } o null.
+ */
+function dnsShimSettings(env = process.env, config = createConfig(env), fsImpl = fs) {
+  if (env.FREEBUFF_ANDROID_NO_DNS_SHIM) return null;
+  const prefix = env.PREFIX;
+  if (!prefix) return null;
+  // Linux/PC normal ya tiene /etc/resolv.conf → no hace falta.
+  if (fsImpl.existsSync('/etc/resolv.conf')) return null;
+  const resolvConf = path.join(prefix, 'etc', 'resolv.conf');
+  if (!fsImpl.existsSync(resolvConf)) return null;
+  if (!fsImpl.existsSync(config.dnsShimPath)) return null;
+  return { shim: config.dnsShimPath, resolvConf };
+}
+
+/**
  * Configuración derivada dinámicamente de $HOME / $PREFIX.
  * No hay rutas de instalación hardcodeadas: todo cuelga de ~/.config/manicode
  * (el mismo directorio que usa el launcher oficial de Freebuff) o de TMPDIR.
@@ -90,6 +117,9 @@ function createConfig(env = process.env, homedir = os.homedir) {
     backupPath: path.join(configDir, `${PACKAGE}.previous`),
     // patchelf aarch64 empaquetado en el paquete npm (lib/patchelf-aarch64).
     patchelfPath: path.join(__dirname, 'lib', 'patchelf-aarch64'),
+    // Shim DNS aarch64 (lib/dns-redirect-aarch64.so): redirige /etc/resolv.conf
+    // al resolv.conf de glibc-runner para que el resolver de Bun (c-ares) funcione.
+    dnsShimPath: path.join(__dirname, 'lib', 'dns-redirect-aarch64.so'),
     // Directorio de librerías glibc de glibc-runner, derivado de $PREFIX.
     glibcPrefix: env.PREFIX ? path.join(env.PREFIX, 'glibc') : null,
     // Solo detección: nunca se escribe en esta ruta.
@@ -906,6 +936,11 @@ function createWrapper({
     const shim = doctorShimStatus();
     console.log(`Broker shim: ${shim.ok ? shim.label : shim.label} → ${config.shimPath}`);
 
+    const dnsShim = dnsShimSettings(env, config, fsImpl);
+    console.log(
+      `Shim DNS: ${dnsShim ? `ACTIVO → ${dnsShim.shim}` : 'inactivo (no necesario o desactivado)'}`,
+    );
+
     if (!binExists) {
       console.log('\n➜ El binario no está instalado. Ejecuta: freebuff android-setup');
       return;
@@ -1086,12 +1121,23 @@ function createWrapper({
       FREEBUFF_ANDROID_GRUN: runnerCmd,
       FREEBUFF_ANDROID_BROKER_SHIM: shimPath,
     };
+    // Shim DNS (solo ejecución directa): LD_PRELOAD se elimina en sanitizeEnv
+    // (libtermux-exec rompe el loader glibc), así que lo añadimos EXPRESAMENTE
+    // después. En modo grun no aplica (grun quita LD_PRELOAD por diseño).
+    const dnsShim = dnsShimSettings(process.env, config, fsImpl);
+    const directEnv = sanitizeEnv(baseEnv);
+    if (dnsShim) {
+      directEnv.LD_PRELOAD = dnsShim.shim;
+      directEnv.FREEBUFF_RESOLV_CONF = dnsShim.resolvConf;
+    }
+
     child = directRun
       ? // Ejecución directa: process.execPath = binario → el broker se
-        // re-ejecuta solo. LD_PRELOAD/LD_LIBRARY_PATH fuera (ver sanitizeEnv).
+        // re-ejecuta solo. LD_PRELOAD/LD_LIBRARY_PATH fuera (ver sanitizeEnv),
+        // salvo el shim DNS añadido arriba (ver dnsShimSettings).
         spawn(config.binaryPath, args, {
           stdio: 'inherit',
-          env: sanitizeEnv(baseEnv),
+          env: directEnv,
         })
       : // Respaldo: vía grun (la TUI funciona; el broker requiere parche/shims).
         spawn(runnerCmd, [config.binaryPath, ...args], {
@@ -1135,6 +1181,7 @@ module.exports = {
   createWrapper,
   createConfig,
   defaultIo,
+  dnsShimSettings,
   BROKER_SHIM_TEMPLATE,
   WRAPPER_VERSION,
   compareVersions,

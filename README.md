@@ -19,6 +19,9 @@
 - Runs the official binary in **direct mode** (rewrites its ELF interpreter
   with a bundled `patchelf` and drops `LD_PRELOAD`), which makes the
   **terminal command broker work without patching the CLI source**.
+- Ships an **LD_PRELOAD DNS shim** that gives Bun's internal resolver a
+  working `/etc/resolv.conf`, fixing `read_url` and any in-binary
+  hostname resolution on Android.
 
 ## Direct execution mode (v0.3.0)
 
@@ -44,6 +47,27 @@ The wrapper fixes this without touching the CLI source:
 
 If `patchelf` or the direct smoke test fails, the wrapper falls back to
 `grun` mode (the TUI works, but terminal commands are unavailable).
+
+## Android DNS shim (v0.4.0)
+
+Some in-binary features resolve DNS with Bun's internal resolver, which reads
+`/etc/resolv.conf` **literally**. On Android that file does not exist (only
+root could create it), so the resolver falls back to `127.0.0.1:53` and every
+hostname lookup dies with `getaddrinfo ETIMEOUT` — that is exactly why the
+`read_url` tool fails on-device while working on desktop (which has a real
+`/etc/resolv.conf`).
+
+The wrapper ships a tiny `LD_PRELOAD` shim (`lib/dns-redirect-aarch64.so`,
+source in `lib/dns-redirect.c`) that intercepts `open`/`openat`/`stat`/etc.
+and redirects `/etc/resolv.conf` to `$PREFIX/etc/resolv.conf` (the
+`glibc-runner` one, already pointing at reachable nameservers — direct UDP
+DNS works fine from Android apps). No root, no PRoot, no daemons. Verified
+with real Bun 1.3.14 (the runtime embedded in the binary): `dns.lookup` went
+from `ETIMEOUT` (~25 s) to OK (~50 ms).
+
+- Only active in **direct mode** (`grun` strips `LD_PRELOAD` by design).
+- Disable it with `FREEBUFF_ANDROID_NO_DNS_SHIM=1`.
+- Not needed on OSes that already have `/etc/resolv.conf` (desktop).
 
 ## Status: verified on real Android hardware
 
@@ -192,6 +216,8 @@ freebuff-android/
 ├── index.js                  # Definitive launcher (`freebuff` entry point)
 ├── lib/broker-shim.sh        # Canonical shim copy (verified by tests)
 ├── lib/patchelf-aarch64      # Bundled patchelf (ARM64) for direct mode
+├── lib/dns-redirect.c        # DNS shim source (LD_PRELOAD)
+├── lib/dns-redirect-aarch64.so  # Compiled DNS shim (ARM64)
 ├── patches/
 │   ├── terminal-command-broker.patch.ts   # CLI patch documentation
 │   └── apply.js              # Idempotent patch applier
