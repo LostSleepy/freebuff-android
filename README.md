@@ -1,5 +1,7 @@
 # Freebuff Android/Termux — Unofficial Android compatibility layer
 
+[![Release](https://img.shields.io/github/v/release/LostSleepy/freebuff-android?style=flat-square)](https://github.com/LostSleepy/freebuff-android/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](./LICENSE)
+
 > ⚠️ **Unofficial layer.** This project is not affiliated with, endorsed by, or
 > sponsored by Codebuff/Freebuff. It is a community-made compatibility layer
 > that **runs the official Freebuff Linux ARM64 binary** on Android/Termux —
@@ -272,6 +274,25 @@ bash test/e2e/run.sh /path/to/codebuff-checkout
   `pkg install glibc-repo glibc-runner`); if it is missing, the wrapper falls
   back to `grun` mode where terminal commands are unavailable.
 - ARM64 only; no x86 Android support.
+
+## Releases
+
+- **v0.5.0** — Terminal command broker fix: the wrapper resolves the Termux
+  prefix reliably (never hardcoded) and always prepends `$PREFIX/bin` to the
+  child `PATH`, and the DNS shim now intercepts only the `open`/`openat`/
+  `fopen` family (dropping the `stat`/`access` family that broke Bun's
+  executable lookup — the broker no longer fails with
+  `Executable not found in $PATH: "bash"`).
+- **v0.4.0** — LD_PRELOAD DNS shim that redirects `/etc/resolv.conf` for
+  Bun's internal resolver, fixing in-binary DNS and `read_url` on Android.
+- **v0.3.0** — Direct execution mode (patched ELF interpreter, no
+  `LD_PRELOAD`) makes the terminal command broker work without patching the
+  CLI source.
+- **v0.2.0** — First release: official Freebuff Linux ARM64 binary running on
+  Android/Termux with SHA-256 verification, rollback and `grun` fallback.
+
+See the [releases page](https://github.com/LostSleepy/freebuff-android/releases)
+for the full notes.
 
 ## License
 
