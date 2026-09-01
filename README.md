@@ -58,12 +58,21 @@ hostname lookup dies with `getaddrinfo ETIMEOUT` — that is exactly why the
 `/etc/resolv.conf`).
 
 The wrapper ships a tiny `LD_PRELOAD` shim (`lib/dns-redirect-aarch64.so`,
-source in `lib/dns-redirect.c`) that intercepts `open`/`openat`/`stat`/etc.
-and redirects `/etc/resolv.conf` to `$PREFIX/etc/resolv.conf` (the
+source in `lib/dns-redirect.c`) that intercepts the `open`/`openat`/`fopen`
+family and redirects `/etc/resolv.conf` to `$PREFIX/etc/resolv.conf` (the
 `glibc-runner` one, already pointing at reachable nameservers — direct UDP
 DNS works fine from Android apps). No root, no PRoot, no daemons. Verified
 with real Bun 1.3.14 (the runtime embedded in the binary): `dns.lookup` went
 from `ETIMEOUT` (~25 s) to OK (~50 ms).
+
+The shim deliberately does **not** intercept `stat`/`access`/`faccessat`/
+`fstatat`: Bun's runtime interposes its own versions of those symbols, so
+`dlsym(RTLD_NEXT, ...)` from the shim resolved to Bun's implementation and
+every executable lookup by PATH inside the broker failed with
+`Executable not found in $PATH: "bash"` (the terminal command broker re-runs
+the binary, which inherits the shim). The resolver only needs to *open*
+`/etc/resolv.conf` (c-ares/glibc use `fopen`/`open`), so the open-family
+redirect is sufficient and leaves the broker's PATH lookup untouched.
 
 - Only active in **direct mode** (`grun` strips `LD_PRELOAD` by design).
 - Disable it with `FREEBUFF_ANDROID_NO_DNS_SHIM=1`.
@@ -179,6 +188,19 @@ node patches/apply.js /path/to/checkout/cli/src/utils
 
 Direct mode is preferred: it needs no patch and works with the official
 release binary.
+
+### Termux PATH for the broker
+
+Termux's `$PREFIX/bin` is **not** part of Android's system PATH. If the
+session is launched with a minimal environment (app/service/tmux/zsh without
+`$PREFIX` exported), the broker fails with `Executable not found in $PATH:
+bash`. The wrapper resolves the prefix reliably — from `$PREFIX` when it is
+exported, otherwise derived from `$HOME` (`<prefix>/home`, validated against
+`<prefix>/bin` on disk, no hardcoded path) — and always prepends `$PREFIX/bin`
+to the child PATH (without duplicates), so `bash`, `git`, `grun` and the rest
+of Termux's binaries resolve no matter how Freebuff was started. The same
+resolved prefix feeds the DNS shim, so `read_url` keeps working from those
+minimal environments too.
 
 ### `android-doctor`
 

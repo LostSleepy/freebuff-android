@@ -32,7 +32,7 @@ const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const tar = require('tar');
 
-const WRAPPER_VERSION = '0.4.0';
+const WRAPPER_VERSION = '0.5.0';
 const PACKAGE = 'freebuff';
 const DISPLAY_NAME = 'Freebuff';
 const RELEASE_REPO = 'CodebuffAI/codebuff-community';
@@ -71,6 +71,38 @@ const BROKER_SHIM_TEMPLATE = [
   'exec "$GRUN" "$BIN" "$@"',
   '',
 ].join('\n');
+
+/**
+ * Resuelve de forma robusta el PREFIX de Termux, sin hardcodear la ruta:
+ *
+ * 1. Si $PREFIX está exportado, se usa tal cual (fuente fiable).
+ * 2. Si no (sesión lanzada por una app/servicio/tmux con entorno mínimo), se
+ *    deriva de $HOME: en Termux $HOME es <prefix>/home, así que el prefijo es
+ *    $HOME/../usr. Solo se acepta si <candidato>/bin existe de verdad (nunca
+ *    se escribe ni se asume una ruta fija).
+ *
+ * Devuelve null si no se puede determinar (Linux normal, Android sin Termux).
+ */
+function termuxPrefix(env = process.env, fsImpl = fs, homedirFn = os.homedir) {
+  if (env.PREFIX) return env.PREFIX;
+  const home = env.HOME || homedirFn();
+  if (!home) return null;
+  const candidate = path.join(home, '..', 'usr');
+  return fsImpl.existsSync(path.join(candidate, 'bin')) ? candidate : null;
+}
+
+/**
+ * Antepone `bin` a un PATH (string separado por ':') si no está ya incluido.
+ * Devuelve el PATH original si `bin` es null/'' o ya está presente (nunca
+ * duplica entradas). Mantiene exactamente el comportamiento previo para PATH
+ * vacío/undefined (añade ':' final, como hacía el launcher desde v0.4.0).
+ */
+function pathWithBin(pathValue, bin) {
+  if (!bin) return pathValue;
+  const entries = (pathValue || '').split(':').filter(Boolean);
+  if (entries.includes(bin)) return pathValue;
+  return pathValue ? `${bin}:${pathValue}` : `${bin}:`;
+}
 
 /**
  * Decide si inyectar el shim DNS (dns-redirect-aarch64.so) al lanzar el
@@ -1114,8 +1146,25 @@ function createWrapper({
       process.on(sig, onSignal);
     }
 
+    // Termux NO está en el PATH del sistema Android. Si la sesión se lanzó
+    // con un PATH mínimo (app/servicio/tmux/zsh con entorno limpio), el broker
+    // (o el shim) no encuentra "bash" ni "grun" por PATH y falla con
+    // "Executable not found in $PATH: bash". Para que esto sea robusto venga
+    // de donde venga el lanzamiento, resolvemos el PREFIX de forma fiable
+    // ($PREFIX exportado, o derivado de $HOME con verificación en disco) y
+    // aseguramos $PREFIX/bin al principio del PATH del hijo (sin duplicarlo);
+    // así el binario y todo lo que su broker ejecute (bash, git, grun, ...)
+    // resuelven los ejecutables de Termux.
+    const termuxPrefixValue = termuxPrefix(env, fsImpl);
+    const termuxBin = termuxPrefixValue
+      ? path.join(termuxPrefixValue, 'bin')
+      : null;
     const baseEnv = {
       ...process.env,
+      // Si hubo que derivar el prefijo, exponerlo también en el hijo (y en el
+      // shim DNS, ver más abajo) en lugar de dejarlo ausente.
+      ...(termuxPrefixValue ? { PREFIX: termuxPrefixValue } : {}),
+      PATH: pathWithBin(process.env.PATH, termuxBin),
       TERM: process.env.TERM || 'xterm-256color',
       FREEBUFF_ANDROID_BIN: config.binaryPath,
       FREEBUFF_ANDROID_GRUN: runnerCmd,
@@ -1123,8 +1172,17 @@ function createWrapper({
     };
     // Shim DNS (solo ejecución directa): LD_PRELOAD se elimina en sanitizeEnv
     // (libtermux-exec rompe el loader glibc), así que lo añadimos EXPRESAMENTE
-    // después. En modo grun no aplica (grun quita LD_PRELOAD por diseño).
-    const dnsShim = dnsShimSettings(process.env, config, fsImpl);
+    // después. En modo grun no aplica (grun quita LD_PRELOAD por diseño). Se
+    // le pasa el entorno con el PREFIX ya resuelto para que el shim tampoco se
+    // desactive cuando la sesión no exportó $PREFIX (el mismo hueco que el
+    // PATH del broker).
+    const dnsShim = dnsShimSettings(
+      termuxPrefixValue
+        ? { ...process.env, PREFIX: termuxPrefixValue }
+        : process.env,
+      config,
+      fsImpl,
+    );
     const directEnv = sanitizeEnv(baseEnv);
     if (dnsShim) {
       directEnv.LD_PRELOAD = dnsShim.shim;
@@ -1182,6 +1240,8 @@ module.exports = {
   createConfig,
   defaultIo,
   dnsShimSettings,
+  termuxPrefix,
+  pathWithBin,
   BROKER_SHIM_TEMPLATE,
   WRAPPER_VERSION,
   compareVersions,

@@ -6,10 +6,23 @@
  * podría crear root), así que el resolver cae a su valor por defecto
  * (127.0.0.1:53) y toda resolución muere con "getaddrinfo ETIMEOUT".
  *
- * Este shim intercepta las llamadas de apertura/estadística y redirige
- * "/etc/resolv.conf" al resolv.conf real de glibc-runner
+ * Este shim intercepta las llamadas de APERTURA (open/open64/openat/openat64
+ * y sus variantes fortify __open*_2/__openat*_2, más fopen/fopen64) y
+ * redirige "/etc/resolv.conf" al resolv.conf real de glibc-runner
  * ($PREFIX/etc/resolv.conf, con nameserver 8.8.8.8, que SÍ responde por UDP
  * directo desde apps de Android). Sin root, sin PRoot, sin daemons.
+ *
+ * IMPORTANTE: NO intercepta stat/lstat/access/faccessat/fstatat ni la familia
+ * __xstat/__lxstat. La v0.4.0 interceptaba esa familia y eso rompía la
+ * resolución de ejecutables por PATH del runtime de Bun: el terminal command
+ * broker (que re-ejecuta el binario) fallaba con "Executable not found in
+ * $PATH: bash" para TODOS los comandos. El runtime de Bun interpone sus
+ * propias versiones de esos símbolos, así que dlsym(RTLD_NEXT, "stat") desde
+ * el shim resuelve a la implementación de Bun (no a glibc) y devuelve ENOENT
+ * para rutas normales. Además la familia stat/access NO hace falta: el
+ * resolver (c-ares/Bun y glibc) abre /etc/resolv.conf con fopen/open, no lo
+ * comprueba solo con stat. El redirect de apertura es suficiente y no toca el
+ * PATH lookup del broker.
  *
  * Compilación (aarch64):
  *   clang -shared -fPIC -O2 -nostdlib \
@@ -65,7 +78,7 @@ static int do_open(const char *path, int flags, va_list ap, int is64) {
     if (!real) return -1;
     /* El modo solo aplica al crear; pasarlo siempre es inocuo. */
     unsigned int mode = 0;
-    if (flags & (0x40 /*O_CREAT*/ | 0x200 /*O_TMPFILE*/)) {
+    if (flags & 0x40 /*O_CREAT*/) {
         mode = (unsigned int)va_arg(ap, int);
     }
     return real(path, flags, mode);
@@ -101,7 +114,7 @@ static int do_openat(int dirfd, const char *path, int flags, va_list ap, int is6
     if (should_redirect(path)) path = resolv_source();
     if (!real) return -1;
     unsigned int mode = 0;
-    if (flags & (0x40 | 0x200)) mode = (unsigned int)va_arg(ap, int);
+    if (flags & 0x40) mode = (unsigned int)va_arg(ap, int);
     return real(dirfd, path, flags, mode);
 }
 
@@ -138,61 +151,4 @@ void *fopen64(const char *path, const char *mode) {
     fopen_fn real = (fopen_fn)dlsym(RTLD_NEXT, "fopen64");
     if (should_redirect(path)) path = resolv_source();
     return real ? real(path, mode) : 0;
-}
-
-/* ---- stat / lstat / stat64 / lstat64 ---- */
-typedef int (*stat_fn)(const char *, void *);
-
-static int do_stat(const char *real_name, const char *path, void *buf) {
-    stat_fn real = (stat_fn)dlsym(RTLD_NEXT, real_name);
-    if (should_redirect(path)) path = resolv_source();
-    return real ? real(path, buf) : -1;
-}
-int stat(const char *path, void *buf) { return do_stat("stat", path, buf); }
-int stat64(const char *path, void *buf) { return do_stat("stat64", path, buf); }
-int lstat(const char *path, void *buf) { return do_stat("lstat", path, buf); }
-int lstat64(const char *path, void *buf) { return do_stat("lstat64", path, buf); }
-
-/* glibc <= 2.32 (ya no existen en modernas; si no se llaman, no importa). */
-int __xstat(int ver, const char *path, void *buf) {
-    (void)ver;
-    return do_stat("__xstat", path, buf);
-}
-int __xstat64(int ver, const char *path, void *buf) {
-    (void)ver;
-    return do_stat("__xstat64", path, buf);
-}
-int __lxstat(int ver, const char *path, void *buf) {
-    (void)ver;
-    return do_stat("__lxstat", path, buf);
-}
-int __lxstat64(int ver, const char *path, void *buf) {
-    (void)ver;
-    return do_stat("__lxstat64", path, buf);
-}
-
-/* ---- access / fstatat / faccessat ---- */
-int access(const char *path, int mode) {
-    int (*real)(const char *, int) = (int (*)(const char *, int))dlsym(RTLD_NEXT, "access");
-    if (should_redirect(path)) path = resolv_source();
-    return real ? real(path, mode) : -1;
-}
-
-typedef int (*fstatat_fn)(int, const char *, void *, int);
-
-static int do_fstatat(int dirfd, const char *path, void *buf, int flags, int is64) {
-    fstatat_fn real = (fstatat_fn)dlsym(RTLD_NEXT, is64 ? "fstatat64" : "fstatat");
-    if (should_redirect(path)) path = resolv_source();
-    return real ? real(dirfd, path, buf, flags) : -1;
-}
-int fstatat(int dirfd, const char *path, void *buf, int flags) {
-    return do_fstatat(dirfd, path, buf, flags, 0);
-}
-int fstatat64(int dirfd, const char *path, void *buf, int flags) {
-    return do_fstatat(dirfd, path, buf, flags, 1);
-}
-int faccessat(int dirfd, const char *path, int mode, int flags) {
-    int (*real)(int, const char *, int, int) = (int (*)(int, const char *, int, int))dlsym(RTLD_NEXT, "faccessat");
-    if (should_redirect(path)) path = resolv_source();
-    return real ? real(dirfd, path, mode, flags) : -1;
 }
